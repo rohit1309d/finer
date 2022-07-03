@@ -51,8 +51,8 @@ class DataLoader(tf.keras.utils.Sequence):
         # Find list of batch's sequences + targets
         samples = self.dataset[indices]
 
-        x_batch, y_batch = self.vectorize_fn(samples=samples, max_length=self.max_length)
-        return x_batch, y_batch
+        x_batch, y_batch, masks = self.vectorize_fn(samples=samples, max_length=self.max_length)
+        return x_batch, y_batch, masks 
 
     def on_epoch_end(self):
         """Updates indexes after each epoch"""
@@ -248,12 +248,14 @@ class FINER:
             sample_tokens = samples['tokens']
 
             sample_labels = samples['ner_tags']
+            
+            sample_mask_values = samples['masks']
 
-            batch_token_ids, batch_tags, batch_subword_pooling_mask = [], [], []
+            batch_token_ids, batch_tags, batch_masks, batch_subword_pooling_mask = [], [], [], []
 
             for sample_idx in range(len(sample_tokens)):
 
-                sample_token_ids, sample_tags, subword_pooling_mask = [], [], []
+                sample_token_ids, sample_tags, sample_masks, subword_pooling_mask = [], [], [], []
 
                 sample_token_idx = 1  # idx 0 is reserved for [CLS]
                 for token_idx in range(len(sample_tokens[sample_idx])):
@@ -289,13 +291,16 @@ class FINER:
                     # Subword pooling (As in BERT or Acs et al.)
                     if 'subword_pooling' in self.train_params:
                         label_to_assign = self.idx2tag[sample_labels[sample_idx][token_idx]]
+                        mask_to_assign = sample_mask_values[sample_idx][token_idx]
                         if self.train_params['subword_pooling'] == 'all':  # First token is B-, rest are I-
                             if label_to_assign.startswith('B-'):
                                 remaining_labels = 'I' + label_to_assign[1:]
                             else:
                                 remaining_labels = label_to_assign
+                            remaining_masks = mask_to_assign
                         elif self.train_params['subword_pooling'] in ['first', 'last']:
                             remaining_labels = 'O'
+                            remaining_masks = 0
                         else:
                             raise Exception(f'Choose a valid subword pooling ["all", "first" and "last"] in the train parameters.')
 
@@ -309,17 +314,21 @@ class FINER:
                         if self.train_params['subword_pooling'] in ['first', 'all']:
                             if i == 0:
                                 sample_tags.append(label_to_assign)
+                                sample_masks.append(mask_to_assign)
                                 subword_pooling_mask.append(1)
                             else:
                                 if self.train_params['subword_pooling'] == 'first':
                                     subword_pooling_mask.append(0)
                                 sample_tags.append(remaining_labels)
+                                sample_masks.append(remaining_masks)
                         elif self.train_params['subword_pooling'] == 'last':
                             if i == len(token_ids) - 1:
                                 sample_tags.append(label_to_assign)
+                                sample_masks.append(mask_to_assign)
                                 subword_pooling_mask.append(1)
                             else:
                                 sample_tags.append(remaining_labels)
+                                sample_masks.append(remaining_masks)
                                 subword_pooling_mask.append(0)
 
                 if Configuration['task']['model'] == 'transformer':  # if 'bert' in self.general_params['token_type']:
@@ -328,11 +337,13 @@ class FINER:
                     PAD_ID = self.tokenizer.vocab['[PAD]']
                     sample_token_ids = [CLS_ID] + sample_token_ids + [SEP_ID]
                     sample_tags = ['O'] + sample_tags + ['O']
+                    sample_masks = [0] + sample_masks + [0]
                     subword_pooling_mask = [1] + subword_pooling_mask + [1]
 
                 # Append to batch_token_ids & batch_tags
                 batch_token_ids.append(sample_token_ids)
                 batch_tags.append(sample_tags)
+                batch_masks.append(sample_masks)
                 batch_subword_pooling_mask.append(subword_pooling_mask)
 
             if Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword':
@@ -370,6 +381,13 @@ class FINER:
                 truncating='post'
             )
 
+            masks = pad_sequences(
+                sequences=samples['masks'],
+                maxlen=max_length,
+                padding='post',
+                truncating='post'
+            )
+
         elif Configuration['task']['model'] == 'transformer' \
                 or (Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword'):
 
@@ -383,8 +401,16 @@ class FINER:
                 truncating='post'
             )
 
+            masks = pad_sequences(
+                sequences=batch_masks,
+                maxlen=max_length,
+                padding='post',
+                truncating='post'
+            )
+
             if Configuration['task']['model'] == 'transformer':
                 y[np.where(x[:, -1] != PAD_ID)[0], -1] = 0
+                masks[np.where(x[:, -1] != PAD_ID)[0], -1] = 0
 
         if self.train_params['subword_pooling'] in ['first', 'last']:
             batch_subword_pooling_mask = pad_sequences(
@@ -394,9 +420,9 @@ class FINER:
                 truncating='post'
             )
 
-            return [np.array(x), batch_subword_pooling_mask], y
+            return [np.array(x), batch_subword_pooling_mask], y, masks
         else:
-            return np.array(x), y
+            return np.array(x), y, masks
 
     def build_model(self, train_params=None):
         if Configuration['task']['model'] == 'bilstm':
@@ -614,7 +640,7 @@ class FINER:
 
         y_true, y_pred = [], []
 
-        for x_batch, y_batch in tqdm(generator, ncols=100):
+        for x_batch, y_batch, masks in tqdm(generator, ncols=100):
 
             if self.train_params['subword_pooling'] in ['first', 'last']:
                 pooling_mask = x_batch[1]
@@ -632,23 +658,14 @@ class FINER:
             else:
                 y_pred_temp = np.argmax(y_prob_temp, axis=-1)
 
-            for y_true_i, y_pred_i, l_i, p_i in zip(y_batch, y_pred_temp, lengths, pooling_mask):
-
-                if Configuration['task']['model'] == 'transformer':
-                    if self.train_params['subword_pooling'] in ['first', 'last']:
-                        y_true.append(np.take(y_true_i, np.where(p_i != 0)[0])[1:-1])
-                        y_pred.append(np.take(y_pred_i, np.where(p_i != 0)[0])[1:-1])
-                    else:
-                        y_true.append(y_true_i[1:l_i - 1])
-                        y_pred.append(y_pred_i[1:l_i - 1])
-
-                elif Configuration['task']['model'] == 'bilstm':
-                    if self.train_params['subword_pooling'] in ['first', 'last']:
-                        y_true.append(np.take(y_true_i, np.where(p_i != 0)[0]))
-                        y_pred.append(np.take(y_pred_i, np.where(p_i != 0)[0]))
-                    else:
-                        y_true.append(y_true_i[:l_i])
-                        y_pred.append(y_pred_i[:l_i])
+            
+            for y_true_i, y_pred_i, l_i, p_i, m_i in zip(y_batch, y_pred_temp, lengths, pooling_mask, masks):
+                if self.train_params['subword_pooling'] in ['first', 'last']:
+                    y_true.append(np.take(np.take(y_true_i, np.where(p_i != 0)[0]), np.where(m_i != 0)[0]))
+                    y_pred.append(np.take(np.take(y_pred_i, np.where(p_i != 0)[0]), np.where(m_i != 0)[0]))
+                else:
+                    y_true.append(np.take(y_true_i, np.where(m_i != 0)[0]))
+                    y_pred.append(np.take(y_pred_i, np.where(m_i != 0)[0]))
 
         # Indices to labels in one flattened list
         seq_y_pred_str = []

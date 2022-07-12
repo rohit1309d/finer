@@ -133,7 +133,7 @@ We need to provide the following arguments:
     
 In order to run a train experiment with a `transformer` model we execute:
 ```commandline
-python run_experiment --method transformer --mode train
+python run_experiment.py --method transformer --mode train
 ```
 
 ___

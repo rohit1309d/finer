@@ -7,6 +7,7 @@ import datasets
 import numpy as np
 import tensorflow as tf
 import wandb
+import pandas as pd
 
 from copy import deepcopy
 from tqdm import tqdm
@@ -51,8 +52,8 @@ class DataLoader(tf.keras.utils.Sequence):
         # Find list of batch's sequences + targets
         samples = self.dataset[indices]
 
-        x_batch, y_batch, masks = self.vectorize_fn(samples=samples, max_length=self.max_length)
-        return x_batch, y_batch, masks 
+        x_batch, y_batch, masks, is_subwords = self.vectorize_fn(samples=samples, max_length=self.max_length)
+        return x_batch, y_batch, masks, is_subwords
 
     def on_epoch_end(self):
         """Updates indexes after each epoch"""
@@ -251,11 +252,11 @@ class FINER:
             
             sample_mask_values = samples['masks']
 
-            batch_token_ids, batch_tags, batch_masks, batch_subword_pooling_mask = [], [], [], []
+            batch_token_ids, batch_tags, batch_masks, batch_subword_pooling_mask, batch_is_subwords = [], [], [], [], []
 
             for sample_idx in range(len(sample_tokens)):
 
-                sample_token_ids, sample_tags, sample_masks, subword_pooling_mask = [], [], [], []
+                sample_token_ids, sample_tags, sample_masks, subword_pooling_mask, is_subwords = [], [], [], [], []
 
                 sample_token_idx = 1  # idx 0 is reserved for [CLS]
                 for token_idx in range(len(sample_tokens[sample_idx])):
@@ -306,8 +307,11 @@ class FINER:
 
                     # Assign label to all (multiple) generated tokens, if any
                     token_ids = self.tokenizer(token, add_special_tokens=False).input_ids
+                    issub = [1]*len(token_ids)
+                    issub[0] = 0                    
                     sample_token_idx += len(token_ids)
                     sample_token_ids.extend(token_ids)
+                    is_subwords.extend(issub)
 
                     for i in range(len(token_ids)):
 
@@ -339,12 +343,14 @@ class FINER:
                     sample_tags = ['O'] + sample_tags + ['O']
                     sample_masks = [0] + sample_masks + [0]
                     subword_pooling_mask = [1] + subword_pooling_mask + [1]
+                    is_subwords = [0] + is_subwords + [0]
 
                 # Append to batch_token_ids & batch_tags
                 batch_token_ids.append(sample_token_ids)
                 batch_tags.append(sample_tags)
                 batch_masks.append(sample_masks)
                 batch_subword_pooling_mask.append(subword_pooling_mask)
+                batch_is_subwords.append(is_subwords)
 
             if Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword':
                 for sent_idx, _ in enumerate(batch_token_ids):
@@ -358,6 +364,13 @@ class FINER:
             # Returns an np.array object of shape ( len(batch_size) x max_length ) that contains padded/truncated gold labels
             batch_token_ids = pad_sequences(
                 sequences=batch_token_ids,
+                maxlen=max_length,
+                padding='post',
+                truncating='post'
+            )
+
+            batch_is_subwords = pad_sequences(
+                sequences=batch_is_subwords,
                 maxlen=max_length,
                 padding='post',
                 truncating='post'
@@ -420,9 +433,17 @@ class FINER:
                 truncating='post'
             )
 
-            return [np.array(x), batch_subword_pooling_mask], y, masks
+            if Configuration['task']['model'] == 'transformer' \
+                or (Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword'):
+                return [np.array(x), batch_subword_pooling_mask], y, masks, batch_is_subwords
+            else:
+                return [np.array(x), batch_subword_pooling_mask], y, masks, None
         else:
-            return np.array(x), y, masks
+            if Configuration['task']['model'] == 'transformer' \
+                or (Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword'):
+                return np.array(x), y, masks, batch_is_subwords
+            else:
+                return np.array(x), y, masks, None
 
     def build_model(self, train_params=None):
         if Configuration['task']['model'] == 'bilstm':
@@ -470,6 +491,13 @@ class FINER:
             raise Exception(f'Unrecognized monitor: {self.general_params["loss_monitor"]}')
 
         return monitor_metric, monitor_mode
+
+    def convert_bio_tags_to_normal_tags(self, bio_tag):
+        bio_tag_name = self.idx2tag[bio_tag]
+        if bio_tag_name.startswith('I-') or bio_tag_name.startswith('B-'):
+            return bio_tag_name[2:]
+        
+        return bio_tag_name
 
     def train(self):
 
@@ -639,8 +667,9 @@ class FINER:
         LOGGER.info('Calculating predictions...')
 
         y_true, y_pred = [], []
+        sentences, num_true_pred_tags = [], []
 
-        for x_batch, y_batch, masks in tqdm(generator, ncols=100):
+        for x_batch, y_batch, masks, is_subwords in tqdm(generator, ncols=100):
 
             if self.train_params['subword_pooling'] in ['first', 'last']:
                 pooling_mask = x_batch[1]
@@ -649,7 +678,7 @@ class FINER:
             else:
                 pooling_mask = x_batch
                 y_prob_temp = model.predict(x=x_batch)
-
+            
             # Get lengths and cut results for padded tokens
             lengths = [len(np.where(x_i != 0)[0]) for x_i in x_batch]
 
@@ -657,15 +686,42 @@ class FINER:
                 y_pred_temp = y_prob_temp.astype('int32')
             else:
                 y_pred_temp = np.argmax(y_prob_temp, axis=-1)
-
             
-            for y_true_i, y_pred_i, l_i, p_i, m_i in zip(y_batch, y_pred_temp, lengths, pooling_mask, masks):
-                if self.train_params['subword_pooling'] in ['first', 'last']:
+
+            for y_true_i, y_pred_i, p_i, m_i in zip(y_batch, y_pred_temp, pooling_mask, masks):
+                if self.train_params['subword_pooling'] in ['first', 'last']:         
                     y_true.append(np.take(np.take(y_true_i, np.where(p_i != 0)[0]), np.where(m_i != 0)[0]))
                     y_pred.append(np.take(np.take(y_pred_i, np.where(p_i != 0)[0]), np.where(m_i != 0)[0]))
                 else:
                     y_true.append(np.take(y_true_i, np.where(m_i != 0)[0]))
                     y_pred.append(np.take(y_pred_i, np.where(m_i != 0)[0]))
+
+            for x_i, y_true_i, y_pred_i, m_i, is_sub_i, l_i in zip(x_batch, y_batch, y_pred_temp, masks, is_subwords, lengths):
+                sample_ntpt = []
+                if self.train_params['subword_pooling'] in ['all', 'first']:
+                    tokens = []
+                    tag_i = None
+                    numeral = None
+                    is_imp = 0
+                    for i in range(len(is_sub_i)):
+                        if is_sub_i[i] == 0:
+                            if i != 0 and i+1 < len(is_sub_i) and not is_sub_i[i+1] and is_imp :
+                                numeral = self.tokenizer.decode(tokens)
+                                sample_ntpt.append((numeral, self.convert_bio_tags_to_normal_tags(tag_i[0]), self.convert_bio_tags_to_normal_tags(tag_i[1])))
+                            
+                            tokens = [x_i[i]]
+                            is_imp = m_i[i]
+                            tag_i = (y_true_i[i], y_pred_i[i]) 
+                        else:
+                            tokens.append(x_i[i])
+                    
+                    if is_imp:
+                        numeral = self.tokenizer.decode(tokens)
+                        sample_ntpt.append((numeral, self.convert_bio_tags_to_normal_tags(tag_i[0]), self.convert_bio_tags_to_normal_tags(tag_i[1])))
+
+                    sentences.append(self.tokenizer.decode(x_i[1:l_i-1]))
+                    num_true_pred_tags.append(sample_ntpt)                            
+                    
 
         # Indices to labels in one flattened list
         seq_y_pred_str = []
@@ -690,6 +746,12 @@ class FINER:
             digits=3,
             scheme=IOB2
         )
+
+        eval_df = pd.DataFrame(zip(sentences, num_true_pred_tags), columns = ["sentences", "(numeral, true, prediction)"])
+        eval_df.to_csv('./data/model_eval.csv')
+        eval_df.to_pickle('./data/model_eval.pkl')
+        LOGGER.info('Files saved in data folder')
+
         LOGGER.info(cr)
 
     def evaluate_pretrained_model(self):

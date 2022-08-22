@@ -7,6 +7,8 @@ import datasets
 import numpy as np
 import tensorflow as tf
 import wandb
+import json
+import pdb
 import pandas as pd
 
 from copy import deepcopy
@@ -27,7 +29,6 @@ LOGGER = logging.getLogger(__name__)
 
 
 class DataLoader(tf.keras.utils.Sequence):
-
     def __init__(self, dataset, vectorize_fn, batch_size=8, max_length=128, shuffle=False):
         self.dataset = dataset
         self.vectorize_fn = vectorize_fn
@@ -40,21 +41,17 @@ class DataLoader(tf.keras.utils.Sequence):
         self.shuffle = shuffle
         if self.shuffle:
             np.random.shuffle(self.indices)
-
     def __len__(self):
         """Denotes the numbers of batches per epoch"""
         return int(np.ceil(len(self.indices) / self.batch_size))
-
     def __getitem__(self, index):
         """Generate one batch of data"""
         # Generate indexes of the batch
         indices = self.indices[index * self.batch_size:(index + 1) * self.batch_size]
         # Find list of batch's sequences + targets
         samples = self.dataset[indices]
-
         x_batch, y_batch, masks, is_subwords = self.vectorize_fn(samples=samples, max_length=self.max_length)
         return x_batch, y_batch, masks, is_subwords
-
     def on_epoch_end(self):
         """Updates indexes after each epoch"""
         if self.shuffle:
@@ -175,10 +172,13 @@ class FINER:
 
     @staticmethod
     def load_dataset_tags():
-
-        dataset = datasets.load_dataset('nlpaueb/finer-139', split='train', streaming=True)
-        dataset_tags = dataset.features['ner_tags'].feature.names
-        tag2idx = {tag: int(i) for i, tag in enumerate(dataset_tags)}
+        data_files = {"train": "train_finer.csv", "test": "test_finer.csv",
+                      "validation": "dev_finer.csv"}
+        dataset = datasets.load_dataset(
+            path='/home/soumyasharma/HULK/Financial-GS/Financial-Numerical-Extreme-Classification/datav3/finer',
+            data_files=data_files, split='train', streaming=True)
+        dataset_tags = json.load(open('/home/soumyasharma/HULK/Financial-GS/Financial-Numerical-Extreme-Classification/datav3/finer/labels.json'))
+        tag2idx = {tag: int(dataset_tags[tag]) for _, tag in enumerate(dataset_tags)}
         idx2tag = {idx: tag for tag, idx in tag2idx.items()}
 
         return tag2idx, idx2tag
@@ -196,7 +196,6 @@ class FINER:
 
     def vectorize(self, samples, max_length):
         if Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'word':
-
             sample_tokens = [
                 [
                     token.lower()
@@ -204,7 +203,6 @@ class FINER:
                 ]
                 for sample in samples['tokens']
             ]
-
             if 'word.num' in self.train_params['embeddings']:
                 sample_tokens = [
                     [
@@ -214,7 +212,6 @@ class FINER:
                     ]
                     for sample in sample_tokens
                 ]
-
             elif 'word.shape' in self.train_params['embeddings']:
                 for sample_idx, _ in enumerate(sample_tokens):
                     for token_idx, _ in enumerate(sample_tokens[sample_idx]):
@@ -224,7 +221,6 @@ class FINER:
                                 sample_tokens[sample_idx][token_idx] = shape
                             else:
                                 sample_tokens[sample_idx][token_idx] = '[NUM]'
-
             word_indices = [
                 [
                     self.word2index[token]
@@ -234,7 +230,6 @@ class FINER:
                 ]
                 for sample in sample_tokens
             ]
-
             word_indices = pad_sequences(
                 sequences=word_indices,
                 maxlen=max_length,
@@ -242,30 +237,19 @@ class FINER:
                 truncating='post'
             )
             x = word_indices
-
         elif Configuration['task']['model'] == 'transformer' \
                 or (Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword'):
-
-            sample_tokens = samples['tokens']
-
-            sample_labels = samples['ner_tags']
-            
-            sample_mask_values = samples['masks']
-
-            batch_token_ids, batch_tags, batch_masks, batch_subword_pooling_mask, batch_is_subwords = [], [], [], [], []
-
+            sample_tokens = [eval(x) for x in samples['tokens']]
+            sample_labels = [eval(x) for x in samples['ner_tags']]
+            batch_token_ids, batch_tags, batch_subword_pooling_mask, batch_is_subwords = [], [], [], []
             for sample_idx in range(len(sample_tokens)):
-
-                sample_token_ids, sample_tags, sample_masks, subword_pooling_mask, is_subwords = [], [], [], [], []
-
+                sample_token_ids, sample_tags, subword_pooling_mask, is_subwords = [], [], [], []
                 sample_token_idx = 1  # idx 0 is reserved for [CLS]
                 for token_idx in range(len(sample_tokens[sample_idx])):
-
                     if (Configuration['task']['model'] == 'transformer' and self.train_params['model_name'] == 'nlpaueb/sec-bert-num') \
                             or (Configuration['task']['model'] == 'bilstm' and 'subword.num' in self.train_params['embeddings']):
                         if re.fullmatch(r'(\d+[\d,.]*)|([,.]\d+)', sample_tokens[sample_idx][token_idx]):
                             sample_tokens[sample_idx][token_idx] = '[NUM]'
-
                     if (Configuration['task']['model'] == 'transformer' and self.train_params['model_name'] == 'nlpaueb/sec-bert-shape') \
                             or (Configuration['task']['model'] == 'bilstm' and 'subword.shape' in self.train_params['embeddings']):
                         if re.fullmatch(r'(\d+[\d,.]*)|([,.]\d+)', sample_tokens[sample_idx][token_idx]):
@@ -274,7 +258,6 @@ class FINER:
                                 sample_tokens[sample_idx][token_idx] = shape
                             else:
                                 sample_tokens[sample_idx][token_idx] = '[NUM]'
-
                     if self.train_params['replace_numeric_values']:
                         if self.is_numeric_value(sample_tokens[sample_idx][token_idx]):
                             if re.fullmatch(r'(\d+[\d,.]*)|([,.]\d+)', sample_tokens[sample_idx][token_idx]):
@@ -286,53 +269,46 @@ class FINER:
                                         sample_tokens[sample_idx][token_idx] = shape
                                     else:
                                         sample_tokens[sample_idx][token_idx] = '[NUM]'
-
                     token = sample_tokens[sample_idx][token_idx]
-
+                    if not token.strip():
+                        continue
+                    # pdb.set_trace()
                     # Subword pooling (As in BERT or Acs et al.)
                     if 'subword_pooling' in self.train_params:
                         label_to_assign = self.idx2tag[sample_labels[sample_idx][token_idx]]
-                        mask_to_assign = sample_mask_values[sample_idx][token_idx]
                         if self.train_params['subword_pooling'] == 'all':  # First token is B-, rest are I-
                             if label_to_assign.startswith('B-'):
                                 remaining_labels = 'I' + label_to_assign[1:]
                             else:
                                 remaining_labels = label_to_assign
-                            remaining_masks = mask_to_assign
                         elif self.train_params['subword_pooling'] in ['first', 'last']:
                             remaining_labels = 'O'
-                            remaining_masks = 0
                         else:
                             raise Exception(f'Choose a valid subword pooling ["all", "first" and "last"] in the train parameters.')
-
                     # Assign label to all (multiple) generated tokens, if any
                     token_ids = self.tokenizer(token, add_special_tokens=False).input_ids
                     issub = [1]*len(token_ids)
-                    issub[0] = 0                    
+                    # print(token)
+                    issub[0] = 0
                     sample_token_idx += len(token_ids)
                     sample_token_ids.extend(token_ids)
                     is_subwords.extend(issub)
-
                     for i in range(len(token_ids)):
 
                         if self.train_params['subword_pooling'] in ['first', 'all']:
                             if i == 0:
                                 sample_tags.append(label_to_assign)
-                                sample_masks.append(mask_to_assign)
                                 subword_pooling_mask.append(1)
                             else:
                                 if self.train_params['subword_pooling'] == 'first':
                                     subword_pooling_mask.append(0)
                                 sample_tags.append(remaining_labels)
-                                sample_masks.append(remaining_masks)
                         elif self.train_params['subword_pooling'] == 'last':
                             if i == len(token_ids) - 1:
                                 sample_tags.append(label_to_assign)
-                                sample_masks.append(mask_to_assign)
                                 subword_pooling_mask.append(1)
                             else:
                                 sample_tags.append(remaining_labels)
-                                sample_masks.append(remaining_masks)
                                 subword_pooling_mask.append(0)
 
                 if Configuration['task']['model'] == 'transformer':  # if 'bert' in self.general_params['token_type']:
@@ -341,14 +317,12 @@ class FINER:
                     PAD_ID = self.tokenizer.vocab['[PAD]']
                     sample_token_ids = [CLS_ID] + sample_token_ids + [SEP_ID]
                     sample_tags = ['O'] + sample_tags + ['O']
-                    sample_masks = [0] + sample_masks + [0]
                     subword_pooling_mask = [1] + subword_pooling_mask + [1]
                     is_subwords = [0] + is_subwords + [0]
 
                 # Append to batch_token_ids & batch_tags
                 batch_token_ids.append(sample_token_ids)
                 batch_tags.append(sample_tags)
-                batch_masks.append(sample_masks)
                 batch_subword_pooling_mask.append(subword_pooling_mask)
                 batch_is_subwords.append(is_subwords)
 
@@ -375,7 +349,6 @@ class FINER:
                 padding='post',
                 truncating='post'
             )
-
             # Replace last column with SEP special token if it's not PAD
             if Configuration['task']['model'] == 'transformer':
                 batch_token_ids[np.where(batch_token_ids[:, -1] != PAD_ID)[0], -1] = SEP_ID
@@ -394,16 +367,9 @@ class FINER:
                 truncating='post'
             )
 
-            masks = pad_sequences(
-                sequences=samples['masks'],
-                maxlen=max_length,
-                padding='post',
-                truncating='post'
-            )
-
         elif Configuration['task']['model'] == 'transformer' \
                 or (Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword'):
-
+            # pdb.set_trace()
             batch_tags = [[self.tag2idx[tag] for tag in sample_tags] for sample_tags in batch_tags]
 
             # Pad/Truncate the rest tags/labels
@@ -414,16 +380,8 @@ class FINER:
                 truncating='post'
             )
 
-            masks = pad_sequences(
-                sequences=batch_masks,
-                maxlen=max_length,
-                padding='post',
-                truncating='post'
-            )
-
             if Configuration['task']['model'] == 'transformer':
                 y[np.where(x[:, -1] != PAD_ID)[0], -1] = 0
-                masks[np.where(x[:, -1] != PAD_ID)[0], -1] = 0
 
         if self.train_params['subword_pooling'] in ['first', 'last']:
             batch_subword_pooling_mask = pad_sequences(
@@ -433,17 +391,19 @@ class FINER:
                 truncating='post'
             )
 
+            # return [np.array(x), batch_subword_pooling_mask], y
             if Configuration['task']['model'] == 'transformer' \
                 or (Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword'):
-                return [np.array(x), batch_subword_pooling_mask], y, masks, batch_is_subwords
+                return [np.array(x), batch_subword_pooling_mask], y, y, batch_is_subwords
             else:
-                return [np.array(x), batch_subword_pooling_mask], y, masks, None
+                return [np.array(x), batch_subword_pooling_mask], y, y, None
         else:
+            # return np.array(x), y
             if Configuration['task']['model'] == 'transformer' \
                 or (Configuration['task']['model'] == 'bilstm' and self.train_params['token_type'] == 'subword'):
-                return np.array(x), y, masks, batch_is_subwords
+                return np.array(x), y, y, batch_is_subwords
             else:
-                return np.array(x), y, masks, None
+                return np.array(x), y, y, None
 
     def build_model(self, train_params=None):
         if Configuration['task']['model'] == 'bilstm':
@@ -496,12 +456,15 @@ class FINER:
         bio_tag_name = self.idx2tag[bio_tag]
         if bio_tag_name.startswith('I-') or bio_tag_name.startswith('B-'):
             return bio_tag_name[2:]
-        
+
         return bio_tag_name
 
     def train(self):
-
-        train_dataset = datasets.load_dataset(path='nlpaueb/finer-139', split='train')
+        # LOGGER.info('Hollllaaaaa')
+        data_files = {"train": "train_finer.csv", "test": "test_finer.csv",
+                      "validation": "dev_finer.csv"}
+        train_dataset = datasets.load_dataset(path='/home/soumyasharma/HULK/Financial-GS/Financial-Numerical-Extreme-Classification/datav3/finer', data_files=data_files, split='train')
+        # pdb.set_trace()
         train_generator = DataLoader(
             dataset=train_dataset,
             vectorize_fn=self.vectorize,
@@ -510,7 +473,7 @@ class FINER:
             shuffle=True
         )
 
-        validation_dataset = datasets.load_dataset(path='nlpaueb/finer-139', split='validation')
+        validation_dataset = datasets.load_dataset(path='/home/soumyasharma/HULK/Financial-GS/Financial-Numerical-Extreme-Classification/datav3/finer', data_files=data_files, split='validation')
         validation_generator = DataLoader(
             dataset=validation_dataset,
             vectorize_fn=self.vectorize,
@@ -519,7 +482,7 @@ class FINER:
             shuffle=False
         )
 
-        test_dataset = datasets.load_dataset(path='nlpaueb/finer-139', split='test')
+        test_dataset = datasets.load_dataset(path='/home/soumyasharma/HULK/Financial-GS/Financial-Numerical-Extreme-Classification/datav3/finer', data_files=data_files, split='test')
         test_generator = DataLoader(
             dataset=test_dataset,
             vectorize_fn=self.vectorize,
@@ -527,15 +490,21 @@ class FINER:
             max_length=self.train_params['max_length'],
             shuffle=False
         )
-
+        # pdb.set_trace()
+        # LOGGER.info('Hollllaaaaa')
         train_params = deepcopy(self.train_params)
         train_params.update(self.hyper_params)
-
+        # LOGGER.info('Hollllaaaaa')
         # Build model
+        # LOGGER.info('Build model')
         model = self.build_model(train_params=train_params)
         LOGGER.info('Model Summary')
+        # LOGGER.info('Hollllaaaaa')
+        # print("Hollaaaaa")
         model.print_summary(print_fn=LOGGER.info)
-
+        # print("Hollaaaaa")
+        LOGGER.info('Hollllaaaaa')
+        print(os.path.join(Configuration['experiment_path'], 'model', 'weights.h5'))
         optimizer = tf.keras.optimizers.Adam(learning_rate=train_params['learning_rate'], clipvalue=5.0)
 
         if train_params['crf']:
@@ -585,7 +554,52 @@ class FINER:
                 verbose=1
             )
         )
-
+        directory = "/home/soumyasharma/HULK/Financial-GS/Financial-Numerical-Extreme-Classification/FiNER.back/saved_models"
+        checkpoint_filepath = '{0}/checkpoints/fxmc-sec-base/checkpoint-{{epoch:02d}}-{{val_loss:.2f}}_save_weights_only.ckpt'.format(directory)
+        callbacks.append(tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_filepath,
+            monitor=monitor,
+            mode=monitor_mode,
+            verbose=1,
+            save_best_only=False,
+            save_freq="epoch",
+            save_weights_only=True,
+        ))
+        directory = "/home/soumyasharma/HULK/Financial-GS/Financial-Numerical-Extreme-Classification/FiNER.back/saved_models"
+        checkpoint_filepath = '{0}/checkpoints/fxmc-sec-base/checkpoint-{{epoch:02d}}-{{val_loss:.2f}}.ckpt'.format(
+            directory)
+        callbacks.append(tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_filepath,
+            monitor=monitor,
+            mode=monitor_mode,
+            verbose=1,
+            save_best_only=False,
+            save_freq="epoch",
+            save_weights_only=False,
+        ))
+        checkpoint_filepath = '{0}/checkpoints/fxmc-sec-base/checkpoint-{{epoch:02d}}-{{val_loss:.2f}}_save_best_only.ckpt'.format(
+            directory)
+        callbacks.append(tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_filepath,
+            monitor=monitor,
+            mode=monitor_mode,
+            verbose=1,
+            save_best_only=True,
+            save_freq="epoch",
+            save_weights_only=False,
+        ))
+        checkpoint_filepath = '{0}/checkpoints/fxmc-sec-base/checkpoint-{{epoch:02d}}-{{val_loss:.2f}}_save_best_only_save_weights_only.ckpt'.format(
+            directory)
+        callbacks.append(tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_filepath,
+            monitor=monitor,
+            mode=monitor_mode,
+            verbose=1,
+            save_best_only=True,
+            save_freq="epoch",
+            save_weights_only=True,
+        ))
+        print("Callbacks!")
         if Configuration['task']['model'] == 'transformer':
             wandb.config.update(
                 {
@@ -623,7 +637,7 @@ class FINER:
 
             )
         )
-
+        print("Now starting training")
         # Train model
         start = time.time()
         history = model.fit(
@@ -643,7 +657,9 @@ class FINER:
         weights_save_path = os.path.join(Configuration['experiment_path'], 'model', 'weights.h5')
         LOGGER.info(f'Saving model weights to {weights_save_path}')
         model.save_weights(filepath=weights_save_path)
-
+        model.save_weights('../../saved_models/checkpoints/fxmc-sec-base/model', save_format='tf')
+        pdb.set_trace()
+        
         # Evaluate
         self.evaluate(model, validation_generator, split_type='validation')
         self.evaluate(model, test_generator, split_type='test')
@@ -668,7 +684,6 @@ class FINER:
 
         y_true, y_pred = [], []
         sentences, num_true_pred_tags = [], []
-
         for x_batch, y_batch, masks, is_subwords in tqdm(generator, ncols=100):
 
             if self.train_params['subword_pooling'] in ['first', 'last']:
@@ -678,7 +693,7 @@ class FINER:
             else:
                 pooling_mask = x_batch
                 y_prob_temp = model.predict(x=x_batch)
-            
+
             # Get lengths and cut results for padded tokens
             lengths = [len(np.where(x_i != 0)[0]) for x_i in x_batch]
 
@@ -686,7 +701,6 @@ class FINER:
                 y_pred_temp = y_prob_temp.astype('int32')
             else:
                 y_pred_temp = np.argmax(y_prob_temp, axis=-1)
-            
 
             for y_true_i, y_pred_i, p_i, m_i in zip(y_batch, y_pred_temp, pooling_mask, masks):
                 if self.train_params['subword_pooling'] in ['first', 'last']:         
@@ -699,6 +713,8 @@ class FINER:
             for x_i, y_true_i, y_pred_i, m_i, is_sub_i, l_i in zip(x_batch, y_batch, y_pred_temp, masks, is_subwords, lengths):
                 sample_ntpt = []
                 if self.train_params['subword_pooling'] in ['all', 'first']:
+                    # print(m_i, is_sub_i)
+                    # pdb.set_trace()
                     tokens = []
                     tag_i = None
                     numeral = None
@@ -708,20 +724,37 @@ class FINER:
                             if i != 0 and i+1 < len(is_sub_i) and not is_sub_i[i+1] and is_imp :
                                 numeral = self.tokenizer.decode(tokens)
                                 sample_ntpt.append((numeral, self.convert_bio_tags_to_normal_tags(tag_i[0]), self.convert_bio_tags_to_normal_tags(tag_i[1])))
-                            
+
                             tokens = [x_i[i]]
                             is_imp = m_i[i]
                             tag_i = (y_true_i[i], y_pred_i[i]) 
                         else:
                             tokens.append(x_i[i])
-                    
+
                     if is_imp:
                         numeral = self.tokenizer.decode(tokens)
                         sample_ntpt.append((numeral, self.convert_bio_tags_to_normal_tags(tag_i[0]), self.convert_bio_tags_to_normal_tags(tag_i[1])))
 
                     sentences.append(self.tokenizer.decode(x_i[1:l_i-1]))
-                    num_true_pred_tags.append(sample_ntpt)                            
-                    
+                    num_true_pred_tags.append(sample_ntpt)   
+            # print(num_true_pred_tags)
+            # for y_true_i, y_pred_i, l_i, p_i in zip(y_batch, y_pred_temp, lengths, pooling_mask):
+
+            #     if Configuration['task']['model'] == 'transformer':
+            #         if self.train_params['subword_pooling'] in ['first', 'last']:
+            #             y_true.append(np.take(y_true_i, np.where(p_i != 0)[0])[1:-1])
+            #             y_pred.append(np.take(y_pred_i, np.where(p_i != 0)[0])[1:-1])
+            #         else:
+            #             y_true.append(y_true_i[1:l_i - 1])
+            #             y_pred.append(y_pred_i[1:l_i - 1])
+
+            #     elif Configuration['task']['model'] == 'bilstm':
+            #         if self.train_params['subword_pooling'] in ['first', 'last']:
+            #             y_true.append(np.take(y_true_i, np.where(p_i != 0)[0]))
+            #             y_pred.append(np.take(y_pred_i, np.where(p_i != 0)[0]))
+            #         else:
+            #             y_true.append(y_true_i[:l_i])
+            #             y_pred.append(y_pred_i[:l_i])
 
         # Indices to labels in one flattened list
         seq_y_pred_str = []
@@ -737,6 +770,7 @@ class FINER:
         flattened_seq_y_true_str = list(itertools.chain.from_iterable(seq_y_true_str))
         assert len(flattened_seq_y_true_str) == len(flattened_seq_y_pred_str)
 
+        # pdb.set_trace()
         # TODO: Check mode (strict, not strict) and scheme
         cr = classification_report(
             y_true=[flattened_seq_y_true_str],
@@ -748,8 +782,8 @@ class FINER:
         )
 
         eval_df = pd.DataFrame(zip(sentences, num_true_pred_tags), columns = ["sentences", "(numeral, true, prediction)"])
-        eval_df.to_csv('./data/model_eval.csv')
-        eval_df.to_pickle('./data/model_eval.pkl')
+        eval_df.to_csv('./saved_models/checkpoints/fxmc-sec-base/model_eval.csv')
+        eval_df.to_pickle('./saved_models/checkpoints/fxmc-sec-base/model_eval.pkl')
         LOGGER.info('Files saved in data folder')
 
         LOGGER.info(cr)
@@ -765,14 +799,18 @@ class FINER:
         # Fake forward pass to get variables
         LOGGER.info('Model Summary')
         model.print_summary(print_fn=LOGGER.info)
-
+        print(self.eval_params['pretrained_model_path'])
         # Load weights by checkpoint
-        model.load_weights(os.path.join(self.eval_params['pretrained_model_path'], 'weights.h5'))
+        model.load_weights(self.eval_params['pretrained_model_path'])
 
         for split in self.eval_params['splits']:
             if split not in ['train', 'validation', 'test']:
                 raise Exception(f'Invalid split selected ({split}). Valid options are "train", "validation", "test"')
-            dataset = datasets.load_dataset(path='nlpaueb/finer-139', split=split)
+            data_files = {"train": "train_finer.csv", "test": "test_finer.csv",
+                          "validation": "dev_finer.csv"}
+            dataset = datasets.load_dataset(
+                path='/home/soumyasharma/HULK/Financial-GS/Financial-Numerical-Extreme-Classification/datav3/finer',
+                data_files=data_files, split=split)
             generator = DataLoader(
                 dataset=dataset,
                 vectorize_fn=self.vectorize,

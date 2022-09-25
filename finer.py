@@ -16,9 +16,11 @@ from tqdm import tqdm
 from gensim.models import KeyedVectors
 from seqeval.metrics import classification_report
 from seqeval.scheme import IOB2
+from sklearn.metrics import top_k_accuracy_score
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from transformers import BertTokenizer, AutoTokenizer
 from wandb.keras import WandbCallback
+from tensorflow.keras import metrics
 
 from configurations import Configuration
 from data import DATA_DIR, VECTORS_DIR
@@ -66,6 +68,7 @@ class FINER:
         self.eval_params = Configuration['evaluation']
         self.tag2idx, self.idx2tag = FINER.load_dataset_tags()
         self.n_classes = len(self.tag2idx)
+		self.k = 5
 
         if Configuration['task']['mode'] == 'train':
             display_name = Configuration['task']['log_name']
@@ -682,7 +685,7 @@ class FINER:
         LOGGER.info(f'\n{split_type.capitalize()} Evaluation\n{"-" * 30}\n')
         LOGGER.info('Calculating predictions...')
 
-        y_true, y_pred = [], []
+        y_true, y_pred, y_score = [], [], []
         sentences, num_true_pred_tags = [], []
         for x_batch, y_batch, masks, is_subwords in tqdm(generator, ncols=100):
 
@@ -696,19 +699,28 @@ class FINER:
 
             # Get lengths and cut results for padded tokens
             lengths = [len(np.where(x_i != 0)[0]) for x_i in x_batch]
+            y_score_temp = []
 
             if model.crf:
                 y_pred_temp = y_prob_temp.astype('int32')
             else:
+                y_score_temp = y_prob_temp.copy()
                 y_pred_temp = np.argmax(y_prob_temp, axis=-1)
 
-            for y_true_i, y_pred_i, p_i, m_i in zip(y_batch, y_pred_temp, pooling_mask, masks):
+            for y_true_i, y_pred_i, y_score_i, p_i, m_i in zip(y_batch, y_pred_temp, y_score_temp, pooling_mask, masks):
                 if self.train_params['subword_pooling'] in ['first', 'last']:         
                     y_true.append(np.take(np.take(y_true_i, np.where(p_i != 0)[0]), np.where(m_i != 0)[0]))
                     y_pred.append(np.take(np.take(y_pred_i, np.where(p_i != 0)[0]), np.where(m_i != 0)[0]))
-                else:
+                    if not model.crf:
+						y_score.append(np.take(np.take(y_score_i, np.where(p_i != 0)[0]), np.where(m_i != 0)[0]))
+				else:
                     y_true.append(np.take(y_true_i, np.where(m_i != 0)[0]))
                     y_pred.append(np.take(y_pred_i, np.where(m_i != 0)[0]))
+					if not model.crf:
+                    	y_score.append(np.take(y_score_i, np.where(m_i != 0)[0]))
+			
+			top_k_accuracy_score = top_k_accuracy_score(y_true, y_score, k=self.k)
+			LOGGER.info(f'top k accuracy score - {top_k_accuracy_score}')
 
             for x_i, y_true_i, y_pred_i, m_i, is_sub_i, l_i in zip(x_batch, y_batch, y_pred_temp, masks, is_subwords, lengths):
                 sample_ntpt = []
